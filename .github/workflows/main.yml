@@ -1,0 +1,54 @@
+name: Build Authentic Android APK
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Install Dependencies
+        run: |
+          pip install flet requests
+          sudo apt-get update
+          sudo apt-get install -y zipalign apksigner default-jdk
+
+      - name: Build Initial Flet APK
+        run: flet build apk
+
+      - name: Inject FFmpeg Native Library
+        run: |
+          wget https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar -O apktool.jar
+          java -jar apktool.jar d build/apk/app-release.apk -o decoded_apk
+          
+          mkdir -p decoded_apk/lib/arm64-v8a
+          
+          wget https://github.com/Khang-NT/ffmpeg-binary-android/releases/download/v4.4/ffmpeg-aarch64
+          mv ffmpeg-aarch64 decoded_apk/lib/arm64-v8a/libffmpeg.so
+          chmod +x decoded_apk/lib/arm64-v8a/libffmpeg.so
+          
+          java -jar apktool.jar b decoded_apk -o unsigned-app.apk
+
+      - name: Sign Android App
+        run: |
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "C=US, O=Android, CN=Android Debug"
+          zipalign -v -p 4 unsigned-app.apk aligned-app.apk
+          apksigner sign --ks debug.keystore --ks-pass pass:android aligned-app.apk
+
+      - name: Upload Finished APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: VimeoDownloader-App
+          path: aligned-app.apk
