@@ -9,7 +9,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Java 17 (Fix for Exit Code 1)
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
@@ -20,35 +20,36 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-
       - name: Install Tools
         run: |
           pip install flet requests
           sudo apt-get update
-          sudo apt-get install -y zipalign apksigner
+          sudo apt-get install -y zipalign apksigner zip unzip
 
       - name: Build Flet APK
         run: flet build apk --verbose
 
-      - name: Inject FFmpeg
+      - name: Inject FFmpeg (Direct ZIP Method)
         run: |
-          # This line automatically finds your APK even if the name changes
+          # 1. Locate the compiled APK
           APK_PATH=$(find build/apk -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            echo "Error: APK not found! Flet build failed."
+            exit 1
+          fi
           echo "Found APK at: $APK_PATH"
           
-          wget https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
-          java -jar apktool.jar d "$APK_PATH" -o decoded_apk
+          # 2. Delete old signatures to prepare for the injection
+          zip -d "$APK_PATH" "META-INF/*" || true
           
-          mkdir -p decoded_apk/lib/arm64-v8a
-          wget https://github.com/Khang-NT/ffmpeg-binary-android/releases/download/v4.4/ffmpeg-aarch64
-          mv ffmpeg-aarch64 decoded_apk/lib/arm64-v8a/libffmpeg.so
-          chmod +x decoded_apk/lib/arm64-v8a/libffmpeg.so
+          # 3. Download FFmpeg and place it in the correct Android architecture folder
+          mkdir -p lib/arm64-v8a
+          wget https://github.com/Khang-NT/ffmpeg-binary-android/releases/download/v4.4/ffmpeg-aarch64 -O lib/arm64-v8a/libffmpeg.so
+          chmod +x lib/arm64-v8a/libffmpeg.so
           
-          java -jar apktool.jar b decoded_apk -o unsigned.apk
+          # 4. Inject the folder directly into the APK archive
+          zip -ur "$APK_PATH" lib/
+          cp "$APK_PATH" unsigned.apk
 
       - name: Sign APK
         run: |
