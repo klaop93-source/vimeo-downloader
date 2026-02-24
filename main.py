@@ -1,4 +1,3 @@
-
 import flet as ft
 import os
 import requests
@@ -16,20 +15,32 @@ session.headers.update({
 })
 
 def get_android_ffmpeg():
-    """Locates the FFmpeg binary injected by the OS package manager."""
+    """Locates the injected FFmpeg binary with strict Android fallback paths."""
+    # 1. Check standard environment path
     lib_dirs = os.environ.get("LD_LIBRARY_PATH", "").split(":")
     for lib_dir in lib_dirs:
         possible_path = os.path.join(lib_dir, "libffmpeg.so")
         if os.path.exists(possible_path):
             return possible_path
-    return "ffmpeg" # Fallback for PC testing
+            
+    # 2. Hard-fallback: Check the app's internal Android data folder directly
+    try:
+        app_home = os.environ.get("HOME", "")
+        if app_home:
+            base_dir = os.path.dirname(app_home)
+            possible_path = os.path.join(base_dir, "lib", "libffmpeg.so")
+            if os.path.exists(possible_path):
+                return possible_path
+    except Exception:
+        pass
+
+    return "ffmpeg" # Fallback for testing on PC
 
 def sanitize_filename(title):
     sanitized = "".join(c for c in title if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
     return sanitized.replace(' ', '_')
 
 def get_vimeo_manifest_url(vimeo_url):
-    """Extracts the hidden JSON manifest URL directly from a Vimeo link."""
     match = re.search(r'vimeo\.com/(?:video/)?(\d+)(?:/([a-zA-Z0-9]+)|\?h=([a-zA-Z0-9]+))?', vimeo_url)
     if not match: return None
     
@@ -56,7 +67,6 @@ def get_vimeo_manifest_url(vimeo_url):
     return None
 
 def download_stream(base_url, track, output_filepath, stream_name, page, progress_bar, status_text):
-    """Downloads segments and updates the UI."""
     segments = track.get("segments", [])
     if not segments: return False
 
@@ -80,113 +90,85 @@ def download_stream(base_url, track, output_filepath, stream_name, page, progres
                     downloaded_size += len(chunk)
                     if total_size > 0:
                         percent_float = downloaded_size / total_size
-                        current_val = progress_bar.value if progress_bar.value is not None else 0.0
-                        if percent_float - current_val > 0.01 or percent_float >= 1.0:
+                        if progress_bar.value is None or percent_float - progress_bar.value > 0.01:
                             progress_bar.value = percent_float
-                            status_text.value = f"⬇️ Downloading {stream_name.capitalize()}: {int(percent_float * 100)}%"
+                            status_text.value = f"⬇️ {stream_name.capitalize()}: {int(percent_float * 100)}%"
                             page.update()
     except Exception as e:
-        status_text.value = f"❌ Error downloading {stream_name}: {e}"
+        status_text.value = f"❌ Error: {e}"
         return False
     return True
 
 def merge_files(video_path, audio_path, output_path):
-    """Merges files using the injected Android FFmpeg binary."""
     ffmpeg_path = get_android_ffmpeg()
     cmd = [ffmpeg_path, '-i', video_path, '-i', audio_path, '-c:v', 'copy', '-c:a', 'copy', '-y', output_path]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        subprocess.run(cmd, check=True, capture_output=True)
         return True
     except Exception:
         return False
 
-# --- App UI ---
 def main(page: ft.Page):
-    page.title = "Vimeo Downloader"
+    page.title = "Vimeo App"
     page.theme_mode = ft.ThemeMode.DARK
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.scroll = "adaptive"
 
-    title_text = ft.Text("🎥 Vimeo Downloader", size=28, weight=ft.FontWeight.BOLD)
-    url_input = ft.TextField(label="Paste Vimeo URL here", width=320)
-    status_text = ft.Text("", color=ft.colors.BLUE_400, text_align=ft.TextAlign.CENTER)
+    url_input = ft.TextField(label="Vimeo URL", width=320)
+    status_text = ft.Text("", text_align=ft.TextAlign.CENTER)
     progress_bar = ft.ProgressBar(width=320, value=0, visible=False)
 
-    def on_download_click(e):
-        if not url_input.value:
-            status_text.value = "❌ Please enter a URL."
-            page.update()
-            return
-
+    def on_download(e):
+        if not url_input.value: return
         download_btn.disabled = True
         progress_bar.visible = True
         progress_bar.value = None
-        status_text.value = "🔍 Analyzing video data..."
-        status_text.color = ft.colors.BLUE_400
+        status_text.value = "Analyzing..."
         page.update()
 
         try:
-            json_url = url_input.value.strip()
-            if "vimeo.com" in json_url and "master.json" not in json_url:
-                json_url = get_vimeo_manifest_url(json_url)
-                if not json_url:
-                    raise ValueError("Could not extract manifest. Ensure it is a valid Vimeo link.")
+            url = url_input.value.strip()
+            manifest_url = get_vimeo_manifest_url(url) if "vimeo.com" in url else url
+            if not manifest_url: raise ValueError("Invalid URL")
 
-            data = session.get(json_url, timeout=30).json()
-            title = sanitize_filename(data.get("title", f"video_{datetime.datetime.now().strftime('%H%M%S')}"))
-            base_url = urljoin(json_url, data.get("base_url", ""))
+            data = session.get(manifest_url).json()
+            title = sanitize_filename(data.get("title", "video"))
+            base = urljoin(manifest_url, data.get("base_url", ""))
+            v_track = sorted(data["video"], key=lambda x: x["bitrate"])[-1]
+            a_track = sorted(data["audio"], key=lambda x: x["bitrate"])[-1]
+
+            path = "/storage/emulated/0/Download"
+            if not os.path.exists(path): path = os.getcwd()
             
-            v_track = sorted(data.get("video", []), key=lambda t: t.get("bitrate", 0), reverse=True)[0]
-            a_track = sorted(data.get("audio", []), key=lambda t: t.get("bitrate", 0), reverse=True)[0]
+            temp_v, temp_a = os.path.join(path, "v.mp4"), os.path.join(path, "a.mp4")
+            final = os.path.join(path, f"{title}.mp4")
 
-            # Set download paths (Internal storage fallback for strict Android 11+ rules)
-            download_dir = "/storage/emulated/0/Download"
-            if not os.path.exists(download_dir): download_dir = os.getenv("HOME", "/tmp")
-            
-            temp_v = os.path.join(download_dir, "temp_v.mp4")
-            temp_a = os.path.join(download_dir, "temp_a.mp4")
-            final_out = os.path.join(download_dir, f"{title}.mp4")
-
-            progress_bar.value = 0.0
-            page.update()
-
-            if download_stream(base_url, v_track, temp_v, "video", page, progress_bar, status_text):
-                progress_bar.value = 0.0
-                if download_stream(base_url, a_track, temp_a, "audio", page, progress_bar, status_text):
+            progress_bar.value = 0
+            if download_stream(base, v_track, temp_v, "video", page, progress_bar, status_text):
+                progress_bar.value = 0
+                if download_stream(base, a_track, temp_a, "audio", page, progress_bar, status_text):
+                    status_text.value = "Merging natively..."
                     progress_bar.value = None
-                    status_text.value = "🔄 Merging video and audio natively..."
                     page.update()
-                    
-                    if merge_files(temp_v, temp_a, final_out):
-                        status_text.value = f"✅ Saved to Downloads:\n{title}.mp4"
+                    if merge_files(temp_v, temp_a, final):
+                        status_text.value = f"✅ Saved: {title}.mp4"
                         status_text.color = ft.colors.GREEN_400
-                        progress_bar.value = 1.0
-                        try: os.remove(temp_v); os.remove(temp_a)
-                        except: pass
-                    else:
-                        status_text.value = "❌ FFmpeg Merge Failed."
+                        try:
+                            os.remove(temp_v); os.remove(temp_a)
+                        except OSError:
+                            pass
+                    else: 
+                        status_text.value = "❌ Merge failed"
                         status_text.color = ft.colors.RED_400
-                else:
-                    status_text.value = "❌ Audio Download Failed."
-                    status_text.color = ft.colors.RED_400
-            else:
-                status_text.value = "❌ Video Download Failed."
-                status_text.color = ft.colors.RED_400
-
-        except Exception as ex:
-            status_text.value = f"❌ Error: {ex}"
+        except Exception as ex: 
+            status_text.value = f"❌ {ex}"
             status_text.color = ft.colors.RED_400
         finally:
             download_btn.disabled = False
             page.update()
 
-    download_btn = ft.ElevatedButton("Download", on_click=on_download_click, width=200)
-
-    page.add(
-        ft.Container(height=20), title_text, ft.Container(height=10),
-        url_input, download_btn, ft.Container(height=10),
-        progress_bar, status_text
-    )
+    download_btn = ft.ElevatedButton("Download", on_click=on_download)
+    page.add(ft.Text("🎥 Vimeo Downloader", size=25), url_input, download_btn, progress_bar, status_text)
 
 if __name__ == "__main__":
     ft.app(target=main)
