@@ -16,7 +16,6 @@ def sanitize_filename(title):
     return sanitized.replace(' ', '_')
 
 def get_vimeo_manifest_url(vimeo_url):
-    """Extracts the hidden JSON manifest URL directly from a Vimeo link."""
     match = re.search(r'vimeo\.com/(?:video/)?(\d+)(?:/([a-zA-Z0-9]+)|\?h=([a-zA-Z0-9]+))?', vimeo_url)
     if not match: return None
     
@@ -42,6 +41,21 @@ def get_vimeo_manifest_url(vimeo_url):
         pass
     return None
 
+# Cache the data so the website doesn't reload when changing the dropdown menu
+@st.cache_data(show_spinner=False)
+def fetch_video_data(url_input):
+    json_url = url_input.strip()
+    if "vimeo.com" in json_url and "master.json" not in json_url:
+        json_url = get_vimeo_manifest_url(json_url)
+        if not json_url:
+            return None, "Invalid URL or could not extract the hidden video files."
+            
+    try:
+        data = session.get(json_url).json()
+        return data, json_url
+    except Exception as e:
+        return None, str(e)
+
 def download_stream(base_url, track, output_filepath, stream_name, progress_bar, status_text):
     segments = track.get("segments", [])
     if not segments: return False
@@ -61,10 +75,9 @@ def download_stream(base_url, track, output_filepath, stream_name, progress_bar,
                     f.write(chunk)
                     downloaded_size += len(chunk)
                     if total_size > 0:
-                        # THE FIX: min() ensures the value never exceeds exactly 1.0
+                        # The Math Fix!
                         percent_float = min(downloaded_size / total_size, 1.0)
                         
-                        # Throttle UI updates so the web browser doesn't freeze
                         if downloaded_size % (8192 * 50) == 0 or percent_float >= 1.0:
                             progress_bar.progress(percent_float)
                             status_text.text(f"⬇️ Downloading {stream_name}: {int(percent_float * 100)}%")
@@ -72,8 +85,8 @@ def download_stream(base_url, track, output_filepath, stream_name, progress_bar,
         status_text.error(f"Error: {e}")
         return False
     return True
+
 def merge_files(video_path, audio_path, output_path):
-    # Because we use packages.txt in GitHub, 'ffmpeg' is natively installed on the server!
     cmd = ['ffmpeg', '-i', video_path, '-i', audio_path, '-c:v', 'copy', '-c:a', 'copy', '-y', output_path]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
@@ -87,61 +100,73 @@ st.title("🎥 Web Vimeo Downloader")
 
 url_input = st.text_input("Paste Vimeo URL here:")
 
-if st.button("Fetch and Process Video"):
-    if not url_input:
-        st.warning("Please enter a URL.")
-        st.stop()
-
-    status_text = st.empty()
-    progress_bar = st.progress(0.0)
-    
-    status_text.info("Analyzing URL...")
-    
-    try:
-        json_url = url_input.strip()
+# If the user has pasted a link, automatically fetch the info
+if url_input:
+    with st.spinner("Analyzing URL..."):
+        data, json_url = fetch_video_data(url_input)
         
-        # Check if it's a standard Vimeo link and extract the manifest
-        if "vimeo.com" in json_url and "master.json" not in json_url:
-            json_url = get_vimeo_manifest_url(json_url)
-            if not json_url:
-                st.error("Invalid URL or could not extract the hidden video files. Check the link.")
-                st.stop()
+    if not data:
+        st.error(f"❌ {json_url}") # This prints the error message from the fetch function
+        st.stop()
+        
+    # --- Create the Resolution Dropdown ---
+    video_tracks = data.get("video", [])
+    # Sort tracks from highest quality to lowest
+    video_tracks.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+    
+    track_mapping = {}
+    for t in video_tracks:
+        # Check if the video has a height attribute (like 1080, 720, etc.)
+        height = t.get("height")
+        if height:
+            label = f"{height}p"
+        else:
+            # Fallback if height is missing
+            label = f"{int(t.get('bitrate', 0)/1000)} kbps"
+            
+        # Add to dictionary if it's not a duplicate
+        if label not in track_mapping:
+            track_mapping[label] = t
 
-        # Fetch the JSON data
-        data = session.get(json_url).json()
+    # Show the Dropdown UI
+    selected_resolution = st.selectbox("Select Video Quality:", list(track_mapping.keys()))
+    
+    # --- Download Button ---
+    if st.button("Download Video"):
+        status_text = st.empty()
+        progress_bar = st.progress(0.0)
+        
+        # Get the specific video track the user selected
+        v_track = track_mapping[selected_resolution]
+        
+        # Automatically grab the absolute best audio track available
+        a_track = sorted(data.get("audio", []), key=lambda x: x.get("bitrate", 0))[-1]
+
         title = sanitize_filename(data.get("title", f"video_{datetime.datetime.now().strftime('%H%M%S')}"))
         base = urljoin(json_url, data.get("base_url", ""))
         
-        # Automatically grab the highest quality video and audio tracks
-        v_track = sorted(data["video"], key=lambda x: x["bitrate"])[-1]
-        a_track = sorted(data["audio"], key=lambda x: x["bitrate"])[-1]
-
-        # Use the server's local working directory for temp files
         temp_v = "temp_v.mp4"
         temp_a = "temp_a.mp4"
-        final_out = f"{title}.mp4"
+        # Include the resolution in the final file name!
+        final_out = f"{title}_{selected_resolution}.mp4"
 
-        # Start the download process
         if download_stream(base, v_track, temp_v, "video", progress_bar, status_text):
             progress_bar.progress(0.0)
             if download_stream(base, a_track, temp_a, "audio", progress_bar, status_text):
                 status_text.info("🔄 Merging video and audio on server...")
                 progress_bar.empty() 
                 
-                # Merge using the server's FFmpeg
                 if merge_files(temp_v, temp_a, final_out):
                     status_text.success("✅ Video successfully processed!")
                     
-                    # Provide a download button to send the file from the server to your device
                     with open(final_out, "rb") as file:
                         st.download_button(
-                            label="⬇️ Download MP4 to Device",
+                            label=f"⬇️ Download {selected_resolution} MP4 to Device",
                             data=file,
                             file_name=final_out,
                             mime="video/mp4"
                         )
                         
-                    # Cleanup server storage immediately after creating the button
                     os.remove(temp_v)
                     os.remove(temp_a)
                 else:
@@ -150,6 +175,3 @@ if st.button("Fetch and Process Video"):
                 st.error("❌ Audio Download Failed.")
         else:
             st.error("❌ Video Download Failed.")
-
-    except Exception as ex:
-        st.error(f"❌ An error occurred: {ex}")
