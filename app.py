@@ -61,7 +61,9 @@ def download_stream(base_url, track, output_filepath, stream_name, progress_bar,
                     f.write(chunk)
                     downloaded_size += len(chunk)
                     if total_size > 0:
-                        percent_float = downloaded_size / total_size
+                        # THE FIX: min() ensures the value never exceeds exactly 1.0
+                        percent_float = min(downloaded_size / total_size, 1.0)
+                        
                         # Throttle UI updates so the web browser doesn't freeze
                         if downloaded_size % (8192 * 50) == 0 or percent_float >= 1.0:
                             progress_bar.progress(percent_float)
@@ -70,7 +72,6 @@ def download_stream(base_url, track, output_filepath, stream_name, progress_bar,
         status_text.error(f"Error: {e}")
         return False
     return True
-
 def merge_files(video_path, audio_path, output_path):
     # Because we use packages.txt in GitHub, 'ffmpeg' is natively installed on the server!
     cmd = ['ffmpeg', '-i', video_path, '-i', audio_path, '-c:v', 'copy', '-c:a', 'copy', '-y', output_path]
