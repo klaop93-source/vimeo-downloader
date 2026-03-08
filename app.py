@@ -52,18 +52,26 @@ st.markdown("""
         margin-left: -5rem;
         margin-right: -5rem;
     }
-    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header-left { display: flex; align-items: center; gap: 14px; }
+    
+    /* UPDATED: Bigger Logo Box */
     .logo-box {
         background-color: var(--primary);
         color: var(--bg-dark);
-        font-weight: 900;
-        font-size: 18px;
-        width: 32px; height: 32px;
+        width: 38px; height: 38px;
         display: flex; justify-content: center; align-items: center;
-        border-radius: 8px;
+        border-radius: 10px;
     }
-    .header-title { font-size: 16px; font-weight: bold; color: var(--text); margin:0;}
-    .header-right { font-size: 11px; color: var(--text-muted); }
+    
+    /* UPDATED: Bigger, Bolder Title */
+    .header-title { 
+        font-size: 24px; 
+        font-weight: 900; 
+        color: var(--text); 
+        margin: 0; 
+        letter-spacing: 0.5px;
+    }
+    .header-right { font-size: 12px; color: var(--text-muted); font-weight: 500;}
 
     /* Inputs & Selectboxes */
     .stTextInput input, .stSelectbox div[data-baseweb="select"] > div {
@@ -137,7 +145,11 @@ st.markdown("""
 
 <div class="custom-header">
     <div class="header-left">
-        <div class="logo-box">⬇</div>
+        <div class="logo-box">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 16 16">
+              <path d="M0 5a2 2 0 0 1 2-2h7.5a2 2 0 0 1 1.983 1.738l3.11-1.382A1 1 0 0 1 16 4.269v7.462a1 1 0 0 1-1.406.913l-3.111-1.382A2 2 0 0 1 9.5 13H2a2 2 0 0 1-2-2V5z"/>
+            </svg>
+        </div>
         <p class="header-title">Vimeo Downloader</p>
     </div>
     <div class="header-right">Built with ❤ by DETOX</div>
