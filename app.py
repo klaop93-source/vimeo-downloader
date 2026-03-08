@@ -1,409 +1,262 @@
-#!/usr/bin/env python3
-"""
-Vimeo Private Video Downloader — Desktop App
-Built with ❤ by DETOX
-"""
-
+import streamlit as st
 import os
-import re
-import json
+import requests
+import base64
 import subprocess
-import threading
-import tempfile
-from io import BytesIO
+import re
+from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import datetime
 
-try:
-    import customtkinter as ctk
-except ImportError:
-    print("Installing customtkinter...")
-    subprocess.check_call(["pip", "install", "customtkinter"])
-    import customtkinter as ctk
+# --- 1. Page Configuration & Custom CSS ---
+st.set_page_config(page_title="Vimeo Downloader | DETOX", page_icon="🎥", layout="centered")
 
-try:
-    import requests
-except ImportError:
-    print("Installing requests...")
-    subprocess.check_call(["pip", "install", "requests"])
-    import requests
+st.markdown("""
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+    
+    div.stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #00C6FF 0%, #0072FF 100%);
+        color: white; border: none; border-radius: 8px; font-weight: bold;
+        transition: all 0.3s ease; box-shadow: 0 4px 15px rgba(0, 114, 255, 0.3);
+    }
+    div.stButton > button[kind="primary"]:hover {
+        transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0, 114, 255, 0.5);
+    }
 
-try:
-    from PIL import Image
-except ImportError:
-    print("Installing Pillow...")
-    subprocess.check_call(["pip", "install", "Pillow"])
-    from PIL import Image
+    .detox-banner {
+        background: linear-gradient(145deg, #18181b, #27272a);
+        border: 1px solid #3f3f46; border-radius: 16px; padding: 30px;
+        text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        margin-top: 60px; position: relative; overflow: hidden;
+    }
+    .detox-banner::before {
+        content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+        background: linear-gradient(90deg, #00C6FF, #25D366, #00C6FF);
+    }
+    .detox-text {
+        color: #a1a1aa; font-size: 13px; letter-spacing: 2px;
+        margin-bottom: 18px; font-weight: 600; text-transform: uppercase;
+    }
+    .detox-brand {
+        background: linear-gradient(90deg, #00C6FF, #0072FF);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        font-weight: 900; font-size: 20px; letter-spacing: 1px;
+    }
+    .wa-btn {
+        text-decoration: none !important; display: inline-flex; align-items: center; 
+        justify-content: center; gap: 10px; background: linear-gradient(90deg, #25D366, #128C7E);
+        color: white !important; padding: 12px 32px; border-radius: 50px; 
+        font-weight: bold; font-size: 16px; transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(37, 211, 102, 0.3);
+    }
+    .wa-btn:hover {
+        transform: translateY(-3px); box-shadow: 0 8px 25px rgba(37, 211, 102, 0.6);
+        background: linear-gradient(90deg, #128C7E, #25D366);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ── Theme ──────────────────────────────────────────────
-BG_DARK = "#0f1012"
-BG_CARD = "#18191d"
-BG_INPUT = "#1e2025"
-BORDER = "#2a2b30"
-PRIMARY = "#00bfff"
-ACCENT = "#0066ff"
-TEXT = "#f2f2f2"
-TEXT_MUTED = "#8a8d9b"
-DESTRUCTIVE = "#e04040"
-SUCCESS = "#22c55e"
-FONT_FAMILY = "Segoe UI"
+# --- 2. Backend Logic (Fast Concurrent Downloader) ---
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
+def extract_vimeo_id(url):
+    match = re.search(r'vimeo\.com/(?:video/)?(\d+)(?:/([a-zA-Z0-9]+)|\?h=([a-zA-Z0-9]+))?', url)
+    if not match: return None, None
+    return match.group(1), match.group(2) or match.group(3)
 
-class VimeoDownloader(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+@st.cache_data(show_spinner=False)
+def fetch_metadata(url):
+    video_id, video_hash = extract_vimeo_id(url)
+    if not video_id: return None, "Invalid Vimeo URL"
 
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+    config_url = f"https://player.vimeo.com/video/{video_id}/config"
+    if video_hash: config_url += f"?h={video_hash}"
 
-        self.title("Vimeo Downloader — DETOX")
-        self.geometry("720x680")
-        self.minsize(600, 580)
-        self.configure(fg_color=BG_DARK)
+    try:
+        resp = requests.get(config_url, headers={**HEADERS, "Referer": url}, timeout=15)
+        resp.raise_for_status()
+        config = resp.json()
 
-        self._build_ui()
+        dash = config.get("request", {}).get("files", {}).get("dash", {})
+        cdns = dash.get("cdns", {})
+        default_cdn = dash.get("default_cdn")
 
-    # ── UI ──────────────────────────────────────────────
-    def _build_ui(self):
-        # Header
-        header = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=56)
-        header.pack(fill="x")
-        header.pack_propagate(False)
+        manifest_url = None
+        if default_cdn and default_cdn in cdns: manifest_url = cdns[default_cdn]["url"]
+        elif cdns: manifest_url = list(cdns.values())[0]["url"]
 
-        logo_frame = ctk.CTkFrame(header, fg_color=PRIMARY, corner_radius=8, width=32, height=32)
-        logo_frame.place(x=16, rely=0.5, anchor="w")
-        ctk.CTkLabel(logo_frame, text="⬇", font=(FONT_FAMILY, 14), text_color=BG_DARK).place(relx=0.5, rely=0.5, anchor="center")
+        if not manifest_url: return None, "Could not find video manifest"
 
-        ctk.CTkLabel(header, text="Vimeo Downloader", font=(FONT_FAMILY, 16, "bold"), text_color=TEXT).place(x=58, rely=0.5, anchor="w")
-        ctk.CTkLabel(header, text="Built with ❤ by DETOX", font=(FONT_FAMILY, 11), text_color=TEXT_MUTED).place(relx=0.95, rely=0.5, anchor="e")
+        manifest_resp = requests.get(manifest_url, headers=HEADERS, timeout=15)
+        manifest_resp.raise_for_status()
+        manifest = manifest_resp.json()
 
-        # Main container
-        container = ctk.CTkFrame(self, fg_color="transparent")
-        container.pack(fill="both", expand=True, padx=24, pady=20)
+        title = config.get("video", {}).get("title", "Unknown")
+        video_tracks = sorted(manifest.get("video", []), key=lambda t: t.get("bitrate", 0), reverse=True)
+        audio_tracks = sorted(manifest.get("audio", []), key=lambda t: t.get("bitrate", 0), reverse=True)
 
-        # URL Section
-        ctk.CTkLabel(container, text="PASTE VIMEO URL", font=(FONT_FAMILY, 11, "bold"), text_color=TEXT_MUTED).pack(anchor="w")
+        base_url_raw = manifest.get("base_url", "")
+        base_url = base_url_raw if base_url_raw.startswith("http") else urljoin(manifest_url, base_url_raw)
 
-        url_row = ctk.CTkFrame(container, fg_color="transparent")
-        url_row.pack(fill="x", pady=(6, 0))
+        qualities = {}
+        for track in video_tracks:
+            h = track.get("height", 0)
+            label = f"{h}p" if h else f"{round(track.get('bitrate', 0) / 1000)} kbps"
+            if label not in qualities:
+                qualities[label] = track
 
-        self.url_entry = ctk.CTkEntry(
-            url_row, placeholder_text="https://vimeo.com/...",
-            height=44, corner_radius=10,
-            fg_color=BG_INPUT, border_color=BORDER, text_color=TEXT,
-            placeholder_text_color=TEXT_MUTED, font=(FONT_FAMILY, 13)
-        )
-        self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.url_entry.bind("<Return>", lambda e: self._on_analyze())
-
-        self.analyze_btn = ctk.CTkButton(
-            url_row, text="🔍  Analyze", width=120, height=44,
-            corner_radius=10, font=(FONT_FAMILY, 13, "bold"),
-            fg_color=PRIMARY, hover_color=ACCENT, text_color=BG_DARK,
-            command=self._on_analyze
-        )
-        self.analyze_btn.pack(side="right")
-
-        # Status bar
-        self.status_label = ctk.CTkLabel(container, text="", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED)
-        self.status_label.pack(anchor="w", pady=(12, 0))
-
-        # Video info card (hidden initially)
-        self.info_card = ctk.CTkFrame(container, fg_color=BG_CARD, corner_radius=14, border_width=1, border_color=BORDER)
-
-        self.thumb_label = ctk.CTkLabel(self.info_card, text="", width=200, height=112)
-        self.thumb_label.pack(side="left", padx=14, pady=14)
-
-        info_text = ctk.CTkFrame(self.info_card, fg_color="transparent")
-        info_text.pack(side="left", fill="both", expand=True, padx=(0, 14), pady=14)
-
-        self.title_label = ctk.CTkLabel(info_text, text="", font=(FONT_FAMILY, 15, "bold"), text_color=TEXT, wraplength=350, anchor="w", justify="left")
-        self.title_label.pack(anchor="w")
-
-        self.duration_label = ctk.CTkLabel(info_text, text="", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED)
-        self.duration_label.pack(anchor="w", pady=(4, 0))
-
-        # Quality selector (hidden initially)
-        self.quality_frame = ctk.CTkFrame(container, fg_color="transparent")
-        self.quality_label = ctk.CTkLabel(self.quality_frame, text="SELECT QUALITY", font=(FONT_FAMILY, 11, "bold"), text_color=TEXT_MUTED)
-        self.quality_label.pack(anchor="w", pady=(0, 8))
-
-        self.quality_buttons_frame = ctk.CTkFrame(self.quality_frame, fg_color="transparent")
-        self.quality_buttons_frame.pack(fill="x")
-
-        # Download button (hidden initially)
-        self.download_btn = ctk.CTkButton(
-            container, text="⬇️  Download Video", height=48,
-            corner_radius=12, font=(FONT_FAMILY, 14, "bold"),
-            fg_color=PRIMARY, hover_color=ACCENT, text_color=BG_DARK,
-            command=self._on_download
-        )
-
-        # Progress bar (hidden initially)
-        self.progress_frame = ctk.CTkFrame(container, fg_color="transparent")
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, height=8, corner_radius=4, fg_color=BG_INPUT, progress_color=PRIMARY)
-        self.progress_bar.pack(fill="x")
-        self.progress_bar.set(0)
-        self.progress_label = ctk.CTkLabel(self.progress_frame, text="0%", font=(FONT_FAMILY, 11), text_color=TEXT_MUTED)
-        self.progress_label.pack(pady=(4, 0))
-
-        # Empty state
-        self.empty_state = ctk.CTkFrame(container, fg_color="transparent")
-        self.empty_state.pack(fill="both", expand=True, pady=30)
-
-        icon_box = ctk.CTkFrame(self.empty_state, fg_color=BG_CARD, corner_radius=16, width=80, height=80)
-        icon_box.pack()
-        icon_box.pack_propagate(False)
-        ctk.CTkLabel(icon_box, text="🎬", font=(FONT_FAMILY, 32)).place(relx=0.5, rely=0.5, anchor="center")
-
-        ctk.CTkLabel(self.empty_state, text="Enter a Vimeo URL to get started", font=(FONT_FAMILY, 14, "bold"), text_color=TEXT).pack(pady=(14, 4))
-        ctk.CTkLabel(self.empty_state, text="Paste any Vimeo video link above to analyze and download.", font=(FONT_FAMILY, 12), text_color=TEXT_MUTED).pack()
-
-        # State
-        self.metadata = None
-        self.selected_quality = None
-        self.quality_btn_refs = []
-
-    # ── Helpers ─────────────────────────────────────────
-    def _set_status(self, msg, color=TEXT_MUTED):
-        self.status_label.configure(text=msg, text_color=color)
-
-    def _set_progress(self, value, label=""):
-        self.progress_bar.set(value)
-        self.progress_label.configure(text=label or f"{int(value * 100)}%")
-
-    # ── Analyze ─────────────────────────────────────────
-    def _on_analyze(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            return
-        self.analyze_btn.configure(state="disabled", text="⏳ Analyzing...")
-        self._set_status("Analyzing video...", PRIMARY)
-        self.empty_state.pack_forget()
-        self.info_card.pack_forget()
-        self.quality_frame.pack_forget()
-        self.download_btn.pack_forget()
-        self.progress_frame.pack_forget()
-        threading.Thread(target=self._analyze_thread, args=(url,), daemon=True).start()
-
-    def _analyze_thread(self, url):
-        try:
-            vid, h = self._extract_id(url)
-            meta = self._fetch_metadata(vid, h)
-            self.metadata = meta
-            self.after(0, self._show_results, meta)
-        except Exception as e:
-            self.after(0, self._set_status, f"❌ {e}", DESTRUCTIVE)
-        finally:
-            self.after(0, lambda: self.analyze_btn.configure(state="normal", text="🔍  Analyze"))
-
-    def _extract_id(self, url):
-        m = re.search(r"vimeo\.com/(?:video/)?(\d+)(?:/([a-f0-9]+))?", url)
-        if not m:
-            m = re.search(r"player\.vimeo\.com/video/(\d+)(?:\?.*?h=([a-f0-9]+))?", url)
-        if not m:
-            raise ValueError("Invalid Vimeo URL")
-        return m.group(1), m.group(2)
-
-    def _fetch_metadata(self, vid, h=None):
-        config_url = f"https://player.vimeo.com/video/{vid}/config"
-        if h:
-            config_url += f"?h={h}"
-        r = requests.get(config_url, headers={"Referer": "https://vimeo.com/"})
-        r.raise_for_status()
-        cfg = r.json()
-        title = cfg.get("video", {}).get("title", "Untitled")
-        duration = cfg.get("video", {}).get("duration", 0)
-        thumb = cfg.get("video", {}).get("thumbs", {}).get("640", "")
-
-        dash_url = None
-        dash_default = cfg.get("request", {}).get("files", {}).get("dash", {})
-        dash_url = dash_default.get("cdns", {})
-        cdn = dash_default.get("default_cdn", "")
-        if cdn and cdn in dash_url:
-            dash_url = dash_url[cdn].get("avc_url") or dash_url[cdn].get("url", "")
-        else:
-            for v in (dash_default.get("cdns") or {}).values():
-                dash_url = v.get("avc_url") or v.get("url", "")
-                break
-
-        if not dash_url:
-            raise ValueError("Could not find video streams")
-
-        mr = requests.get(dash_url, headers={"Referer": "https://vimeo.com/"})
-        mr.raise_for_status()
-        manifest = mr.json()
-        base_url = dash_url.rsplit("/", 1)[0] + "/"
-
-        qualities = []
-        for v in manifest.get("video", []):
-            qualities.append({
-                "label": f'{v.get("height", "?")}p',
-                "width": v.get("width", 0),
-                "height": v.get("height", 0),
-                "bitrate": v.get("bitrate", 0),
-                "base_url": v.get("base_url", ""),
-                "segments": v.get("segments", []),
-                "init_segment": v.get("init_segment", ""),
-            })
-        qualities.sort(key=lambda q: q["height"], reverse=True)
-
-        audio = None
-        audio_list = manifest.get("audio", [])
-        if audio_list:
-            a = max(audio_list, key=lambda x: x.get("bitrate", 0))
-            audio = {
-                "base_url": a.get("base_url", ""),
-                "segments": a.get("segments", []),
-                "init_segment": a.get("init_segment", ""),
-            }
+        best_audio = audio_tracks[0] if audio_tracks else None
 
         return {
             "title": title,
-            "duration": duration,
-            "thumbnail": thumb,
-            "base_url": base_url,
             "qualities": qualities,
-            "audio": audio,
-        }
+            "audio": best_audio,
+            "base_url": base_url,
+        }, None
+    except Exception as e:
+        return None, str(e)
 
-    # ── Show Results ────────────────────────────────────
-    def _show_results(self, meta):
-        self._set_status("✅ Video found!", SUCCESS)
+def download_segments(base_url, track, label, progress_bar, status_text):
+    segments = [s for s in track.get("segments", []) if s.get("url")]
+    total = len(segments)
+    chunks = []
 
-        # Thumbnail
-        try:
-            r = requests.get(meta["thumbnail"], timeout=5)
-            img = Image.open(BytesIO(r.content))
-            img = img.resize((200, 112), Image.LANCZOS)
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(200, 112))
-            self.thumb_label.configure(image=ctk_img, text="")
-            self.thumb_label._ctk_image = ctk_img
-        except:
-            self.thumb_label.configure(text="🎬", font=(FONT_FAMILY, 40))
+    if not segments: return None
 
-        self.title_label.configure(text=meta["title"])
-        mins, secs = divmod(meta["duration"], 60)
-        self.duration_label.configure(text=f"⏱ {int(mins)}:{int(secs):02d}")
-        self.info_card.pack(fill="x", pady=(12, 0))
+    init_seg = track.get("init_segment")
+    if init_seg: chunks.append(base64.b64decode(init_seg))
 
-        # Quality buttons
-        for w in self.quality_buttons_frame.winfo_children():
-            w.destroy()
-        self.quality_btn_refs = []
-        self.selected_quality = None
+    def fetch_seg(i_seg):
+        i, seg = i_seg
+        seg_url = urljoin(base_url, seg["url"])
+        resp = requests.get(seg_url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        return i, resp.content
 
-        for i, q in enumerate(meta["qualities"]):
-            btn = ctk.CTkButton(
-                self.quality_buttons_frame, text=q["label"],
-                width=80, height=36, corner_radius=8,
-                font=(FONT_FAMILY, 12, "bold"),
-                fg_color=BG_INPUT, hover_color=BORDER,
-                border_width=1, border_color=BORDER, text_color=TEXT,
-                command=lambda idx=i: self._select_quality(idx)
-            )
-            btn.pack(side="left", padx=(0, 8))
-            self.quality_btn_refs.append(btn)
+    results = [None] * total
+    done = 0
 
-        if meta["qualities"]:
-            self._select_quality(0)
+    try:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch_seg, (i, seg)): i for i, seg in enumerate(segments)}
+            for future in as_completed(futures):
+                i, data = future.result()
+                results[i] = data
+                done += 1
+                percent_float = min(done / total, 1.0)
+                progress_bar.progress(percent_float)
+                status_text.text(f"⚡ Downloading {label}: {int(percent_float * 100)}%")
+                
+    except Exception as e:
+        status_text.error(f"Error downloading segment: {e}")
+        return None
 
-        self.quality_frame.pack(fill="x", pady=(16, 0))
-        self.download_btn.pack(fill="x", pady=(16, 0))
+    for r in results:
+        if r is not None: chunks.append(r)
+    return b"".join(chunks)
 
-    def _select_quality(self, idx):
-        self.selected_quality = idx
-        for i, btn in enumerate(self.quality_btn_refs):
-            if i == idx:
-                btn.configure(fg_color=f"{PRIMARY}22", border_color=PRIMARY, text_color=PRIMARY)
-            else:
-                btn.configure(fg_color=BG_INPUT, border_color=BORDER, text_color=TEXT)
+def merge_video_audio(video_path, audio_path, output_path):
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-c:v", "copy", "-c:a", "copy", output_path]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
 
-    # ── Download ────────────────────────────────────────
-    def _on_download(self):
-        if self.metadata is None or self.selected_quality is None:
-            return
-        self.download_btn.configure(state="disabled", text="⏳ Downloading...")
-        self.progress_frame.pack(fill="x", pady=(12, 0))
-        self._set_progress(0)
-        threading.Thread(target=self._download_thread, daemon=True).start()
+# --- 3. Main App UI ---
+st.title("🎥 Vimeo Downloader")
+st.markdown("Easily extract and download high-quality videos and audio from Vimeo links.")
+st.write("---")
 
-    def _download_thread(self):
-        try:
-            meta = self.metadata
-            q = meta["qualities"][self.selected_quality]
-            base = meta["base_url"]
+url_input = st.text_input("🔗 Paste Vimeo URL here:", placeholder="https://vimeo.com/...")
+
+if url_input:
+    with st.spinner("🔍 Analyzing URL..."):
+        meta, error_msg = fetch_metadata(url_input)
+        
+    if not meta:
+        st.error(f"❌ {error_msg}")
+        st.stop()
+        
+    st.success(f"📄 **Video Found:** {meta['title']}")
+
+    qualities = meta["qualities"]
+    labels = list(qualities.keys())
+
+    with st.container():
+        st.write("### Download Settings")
+        selected_resolution = st.selectbox("📺 Select Video Quality:", labels)
+        
+        if st.button("🚀 Process & Download Video", use_container_width=True, type="primary"):
+            st.write("---")
+            status_text = st.empty()
+            progress_bar = st.progress(0.0)
+            
+            selected_track = qualities[selected_resolution]
+            base_url = meta["base_url"]
             safe_title = re.sub(r'[^\w\s._-]', '', meta["title"]).replace(" ", "_")
+            if not safe_title: safe_title = f"video_{datetime.datetime.now().strftime('%H%M%S')}"
+            
+            temp_v, temp_a = "temp_v.mp4", "temp_a.mp4"
+            final_out = f"{safe_title}_{selected_resolution}.mp4"
 
-            self.after(0, self._set_status, "Downloading video...", PRIMARY)
-            video_data = self._download_segments(base, q, progress_offset=0, progress_scale=0.6)
-
-            if meta["audio"]:
-                self.after(0, self._set_status, "Downloading audio...", PRIMARY)
-                audio_data = self._download_segments(base, meta["audio"], progress_offset=0.6, progress_scale=0.2)
-
-                self.after(0, self._set_status, "Merging with FFmpeg...", PRIMARY)
-                self.after(0, self._set_progress, 0.85, "Merging...")
-
-                tmp = tempfile.gettempdir()
-                v_path = os.path.join(tmp, "v_temp.mp4")
-                a_path = os.path.join(tmp, "a_temp.m4a")
-                out_path = os.path.join(os.path.expanduser("~"), "Downloads", f"{safe_title}_{q['label']}.mp4")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-                with open(v_path, "wb") as f: f.write(video_data)
-                with open(a_path, "wb") as f: f.write(audio_data)
-
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", v_path, "-i", a_path,
-                    "-c:v", "copy", "-c:a", "copy", out_path
-                ], capture_output=True, check=True)
-
-                os.remove(v_path)
-                os.remove(a_path)
+            # Download Video
+            video_data = download_segments(base_url, selected_track, "Video Stream", progress_bar, status_text)
+            if video_data:
+                with open(temp_v, "wb") as f: f.write(video_data)
+                
+                progress_bar.progress(0.0)
+                
+                # Download Audio
+                if meta["audio"]:
+                    audio_data = download_segments(base_url, meta["audio"], "Audio Stream", progress_bar, status_text)
+                    if audio_data:
+                        with open(temp_a, "wb") as f: f.write(audio_data)
+                        
+                        status_text.info("🔄 Merging natively on server...")
+                        progress_bar.empty() 
+                        
+                        if merge_video_audio(temp_v, temp_a, final_out):
+                            status_text.success("✅ Success! Your video is ready.")
+                            
+                            with open(final_out, "rb") as file:
+                                st.download_button(
+                                    label=f"⬇️ Save {selected_resolution} MP4 to Device",
+                                    data=file, file_name=final_out, mime="video/mp4",
+                                    use_container_width=True, type="primary"
+                                )
+                                
+                            os.remove(temp_v)
+                            os.remove(temp_a)
+                        else:
+                            st.error("❌ Merge Failed.")
+                    else:
+                        st.error("❌ Audio Download Failed.")
+                else:
+                    os.rename(temp_v, final_out)
+                    status_text.success("✅ Success! Video (No Audio) is ready.")
+                    with open(final_out, "rb") as file:
+                        st.download_button(
+                            label=f"⬇️ Save {selected_resolution} MP4",
+                            data=file, file_name=final_out, mime="video/mp4",
+                            use_container_width=True, type="primary"
+                        )
             else:
-                out_path = os.path.join(os.path.expanduser("~"), "Downloads", f"{safe_title}_{q['label']}.mp4")
-                os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                with open(out_path, "wb") as f:
-                    f.write(video_data)
+                st.error("❌ Video Download Failed.")
 
-            self.after(0, self._set_progress, 1.0, "100%")
-            self.after(0, self._set_status, f"✅ Saved to {out_path}", SUCCESS)
-
-        except Exception as e:
-            self.after(0, self._set_status, f"❌ {e}", DESTRUCTIVE)
-        finally:
-            self.after(0, lambda: self.download_btn.configure(state="normal", text="⬇️  Download Video"))
-
-    def _download_segments(self, base_url, track, progress_offset=0, progress_scale=1.0):
-        import base64
-        buf = bytearray()
-        if track.get("init_segment"):
-            buf.extend(base64.b64decode(track["init_segment"]))
-
-        segments = track.get("segments", [])
-        seg_base = base_url + track.get("base_url", "")
-        total = len(segments)
-
-        def fetch(i, seg):
-            url = seg_base + seg["url"]
-            r = requests.get(url, headers={"Referer": "https://vimeo.com/"}, timeout=30)
-            r.raise_for_status()
-            return i, r.content
-
-        results = {}
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(fetch, i, s) for i, s in enumerate(segments)]
-            for done_count, f in enumerate(as_completed(futures), 1):
-                idx, data = f.result()
-                results[idx] = data
-                p = progress_offset + (done_count / total) * progress_scale
-                self.after(0, self._set_progress, p)
-
-        for i in range(total):
-            buf.extend(results[i])
-        return bytes(buf)
-
-
-if __name__ == "__main__":
-    app = VimeoDownloader()
-    app.mainloop()
+# --- 4. Beautiful DETOX Banner & WhatsApp Link ---
+st.markdown("""
+<div class="detox-banner">
+    <div class="detox-text">DEVELOPED BY <span class="detox-brand">DETOX</span></div>
+    <a href="https://whatsapp.com/channel/0029Va7tilcI1rcjV0GC0e2L" target="_blank" class="wa-btn">
+        <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" fill="currentColor" viewBox="0 0 16 16">
+          <path d="M13.601 2.326A7.854 7.854 0 0 0 7.994 0C3.627 0 .068 3.558.064 7.926c0 1.399.366 2.76 1.057 3.965L0 16l4.204-1.102a7.933 7.933 0 0 0 3.79.965h.004c4.368 0 7.926-3.558 7.93-7.93A7.898 7.898 0 0 0 13.6 2.326zM7.994 14.521a6.573 6.573 0 0 1-3.356-.92l-.24-.144-2.494.654.666-2.433-.156-.251a6.56 6.56 0 0 1-1.007-3.505c0-3.626 2.957-6.584 6.591-6.584a6.56 6.56 0 0 1 4.66 1.931 6.557 6.557 0 0 1 1.928 4.66c-.004 3.639-2.961 6.592-6.592 6.592zm3.615-4.934c-.197-.099-1.17-.578-1.353-.646-.182-.065-.315-.099-.445.099-.133.197-.513.646-.627.775-.114.133-.232.148-.43.05-.197-.1-.836-.308-1.592-.985-.59-.525-.985-1.175-1.103-1.372-.114-.198-.011-.304.088-.403.087-.088.197-.232.296-.346.1-.114.133-.198.198-.33.065-.134.034-.248-.015-.347-.05-.099-.445-1.076-.612-1.47-.16-.389-.323-.335-.445-.34-.114-.007-.247-.007-.38-.007a.729.729 0 0 0-.529.247c-.182.198-.691.677-.691 1.654 0 .977.71 1.916.81 2.049.098.133 1.394 2.132 3.383 2.992.47.205.84.326 1.129.418.475.152.904.129 1.246.08.38-.058 1.171-.48 1.338-.943.164-.464.164-.86.114-.943-.049-.084-.182-.133-.38-.232z"/>
+        </svg>
+        Join Now
+    </a>
+</div>
+""", unsafe_allow_html=True)
